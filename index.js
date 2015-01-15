@@ -1,11 +1,14 @@
 
+"use strict";
+
 /**
  * Module dependencies.
  */
 
-var debug = require('debug')('koa-mount');
-var compose = require('koa-compose');
-var assert = require('assert');
+var pathToRegexp = require("path-to-regexp");
+var compose = require("koa-compose");
+var assert = require("assert");
+var debug = require("debuglog")("siren/mount");
 
 /**
  * Expose `mount()`.
@@ -18,77 +21,163 @@ module.exports = mount;
  * may be a Koa application or
  * middleware function.
  *
- * @param {String|Application|Function} prefix, app, or function
+ * @param {String|RegExp|Application|Function} prefix, app, or function
  * @param {Application|Function} [app or function]
  * @return {Function}
  * @api public
  */
 
-function mount(prefix, app) {
-  if ('string' != typeof prefix) {
-    app = prefix;
-    prefix = '/';
+function mount(prefix, app, options) {
+
+  var regexp = prefix;
+  if (typeof prefix !== "string") {
+
+    if (prefix instanceof RegExp) {
+      prefix = prefix.source;
+    } else {
+      options = app;
+      app = prefix;
+      prefix = "/";
+    }
+  } else {
+    assert("/" === prefix[0], "mount path must begin with '/'");
   }
 
-  assert('/' == prefix[0], 'mount path must begin with "/"');
+  var downstream = app.middleware ? compose(app.middleware) : app;
 
-  // compose
-  var downstream = app.middleware
-    ? compose(app.middleware)
-    : app;
+  if (prefix === "/") {
+    return downstream;
+  }
 
-  // don't need to do mounting here
-  if ('/' == prefix) return downstream;
+  debug("mount %s %s", prefix, app.name || "unnamed");
 
-  var trailingSlash = '/' == prefix.slice(-1);
+  options = options || {};
 
-  var name = app.name || 'unnamed';
-  debug('mount %s %s', prefix, name);
+  var keys = [];
+  if (!(regexp instanceof RegExp)) {
+    regexp = pathToRegexp(prefix, keys, {
+      "strict": true,
+      "end": false
+    });
+  }
 
-  return function *(upstream){
+  return function *(upstream) {
+
     var prev = this.path;
-    var newPath = match(prev);
-    debug('mount %s %s -> %s', prefix, name, newPath);
-    if (!newPath) return yield* upstream;
+    var prevParams = this.params;
+    var newParams = [];
+    var newPath = match(regexp, prev, keys, newParams);
 
-    this.mountPath = prefix;
+    if (!newPath) {
+      return yield *upstream;
+    }
+
+    if (options.mergeParams) {
+      newParams = mergeParams(this.params, newParams);
+    }
     this.path = newPath;
-    debug('enter %s -> %s', prev, this.path);
+    this.params = newParams;
 
-    yield* downstream.call(this, function *(){
+    debug("enter %s -> %s", prev, newPath);
+
+    yield *downstream.call(this, function *() {
+
       this.path = prev;
+      this.params = prevParams;
       yield* upstream;
+      this.params = newParams;
       this.path = newPath;
     }.call(this));
 
-    debug('leave %s -> %s', prev, this.path);
+    debug("leave %s -> %s", prev, newPath);
     this.path = prev;
+    this.params = prevParams;
+  };
+}
+
+/**
+ * Check if `prefix` satisfies a `path`.
+ * Returns the new path and fills the `params` according to `keys`.
+ *
+ * @param {RegExp} regexp
+ * @param {String} path
+ * @param {Array} keys
+ * @param {Array} params
+ * @return {String?}
+ * @api private
+ */
+
+function match(regexp, path, keys, params) {
+
+  var matches = regexp.exec(path);
+  if (matches) {
+    params = params || [];
+    var captures = matches.length ? matches.slice(1) : [];
+
+    if (keys.length) {
+      for (var i = -1, l = captures.length; ++i < l;) {
+        if (keys[i]) {
+          var c = captures[i];
+          params[keys[i].name] = c ? safeDecodeURIComponent(c) : c;
+        }
+      }
+    } else {
+      for (var i = -1, l = captures.length; ++i < l;) {
+        var c = captures[i];
+        params[i] = c ? safeDecodeURIComponent(c) : c;
+      }
+    }
+
+    path = path.substr(matches[0].length);
+    if (!path.length || path[0] !== "/") {
+      path = "/" + path;
+    }
+
+    return path;
   }
 
-  /**
-   * Check if `prefix` satisfies a `path`.
-   * Returns the new path.
-   *
-   * match('/images/', '/lkajsldkjf') => false
-   * match('/images', '/images') => /
-   * match('/images/', '/images') => false
-   * match('/images/', '/images/asdf') => /asdf
-   *
-   * @param {String} prefix
-   * @param {String} path
-   * @return {String|Boolean}
-   * @api private
-   */
+  return null;
+}
 
-  function match(path) {
-    // does not match prefix at all
-    if (0 != path.indexOf(prefix)) return false;
+/**
+ * Safe decodeURIComponent, won't throw any error.
+ * If `decodeURIComponent` error happen, just return the original value.
+ *
+ * @param {String} text
+ * @return {String} URL decode original string.
+ */
 
-    var newPath = path.replace(prefix, '') || '/';
-    if (trailingSlash) return newPath;
-
-    // `/mount` does not match `/mountlkjalskjdf`
-    if ('/' != newPath[0]) return false;
-    return newPath;
+function safeDecodeURIComponent(component) {
+  try {
+    return decodeURIComponent(component);
+  } catch (e) {
+    return component;
   }
+}
+
+/**
+ * Merge `b` and `a` into a new object.
+ *
+ * @param {Object} a
+ * @param {Object} b
+ * @return {Object}
+ * @api private
+ */
+
+function mergeParams(a, b) {
+
+  if (!b) {
+    return a;
+  }
+
+  var c = [];
+  for (var prop in a) {
+    c[prop] = a[prop];
+  }
+
+  for (prop in b) {
+    c[prop] = b[prop];
+  }
+
+  return c;
 }
